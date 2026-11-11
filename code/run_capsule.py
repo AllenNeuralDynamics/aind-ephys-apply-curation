@@ -125,7 +125,7 @@ def run() -> None:
             if not any(unit in removed_unit_ids for unit in merge.unit_ids)
         ]
 
-        analyzer_curated = apply_curation(analyzer, curation, merging_mode=merging_mode, censor_ms=censor_ms)
+        analyzer_curated = apply_curation(analyzer, curation, merging_mode=merging_mode, censor_ms=censor_ms, raise_error_if_overlap_fails=False)
         print(f"\tCurated units for {recording_name}: {analyzer_curated.get_num_units()}")
         analyzer_curated.save_as(format="zarr", folder=output_folder)
         restore_recording_provenance(postprocessed_folder, output_folder)
