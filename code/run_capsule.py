@@ -35,6 +35,18 @@ def restore_recording_provenance(input_analyzer_folder: Path, output_analyzer_fo
     zarr.consolidate_metadata(str(output_analyzer_folder))
 
 
+def fill_curation_properties(analyzer_folder: Path) -> None:
+    """
+    Sets is_merged / is_split to False where curation did not set them (no merges or splits in this stream).
+    aind-units-nwb writes all streams in one units table, and a bool property missing in some streams has no
+    null value to fill their rows with.
+    """
+    analyzer = si.load(analyzer_folder, load_extensions=False)
+    for key in ("is_merged", "is_split"):
+        if key not in analyzer.sorting.get_property_keys():
+            analyzer.set_sorting_property(key, np.zeros(analyzer.get_num_units(), dtype=bool))
+
+
 def run() -> None:
     """
     Applies noise removal and the curation.json merges to each postprocessed analyzer.
@@ -89,6 +101,7 @@ def run() -> None:
         if not curation_file.is_file():
             print(f"No curation file found for {recording_name}: copying original analyzer")
             shutil.copytree(postprocessed_folder, output_folder)
+            fill_curation_properties(output_folder)
             continue
         print(f"Found curation file for {recording_name}: {curation_file}")
 
@@ -129,6 +142,7 @@ def run() -> None:
         print(f"\tCurated units for {recording_name}: {analyzer_curated.get_num_units()}")
         analyzer_curated.save_as(format="zarr", folder=output_folder)
         restore_recording_provenance(postprocessed_folder, output_folder)
+        fill_curation_properties(output_folder)
 
         # the curation that was actually applied, used by processing QC
         with open(results_folder / f"curation_{recording_name}.json", "w") as f:
