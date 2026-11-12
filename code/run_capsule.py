@@ -1,5 +1,7 @@
 """Capsule to apply curation to ephys data and generate a new asset"""
 import os
+import sys
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
@@ -37,7 +39,7 @@ def restore_recording_provenance(input_analyzer_folder: Path, output_analyzer_fo
     if not (input_analyzer_folder / "recording").is_dir():
         return
     if (input_analyzer_folder / ".zgroup").is_file() != (output_analyzer_folder / ".zgroup").is_file():
-        print("\tInput and output analyzers have different zarr formats: recording provenance not restored")
+        logging.info("\tInput and output analyzers have different zarr formats: recording provenance not restored")
         return
     shutil.rmtree(output_analyzer_folder / "recording", ignore_errors=True)
     shutil.copytree(input_analyzer_folder / "recording", output_analyzer_folder / "recording")
@@ -87,7 +89,30 @@ def run() -> None:
     if not PARAMS_FILE.is_file():
         raise ValueError(f"Params file not found: {PARAMS_FILE}")
     with open(PARAMS_FILE, "r") as f:
-        apply_curation_params = json.load(f)["apply_curation"]
+        full_params = json.load(f)
+    apply_curation_params = full_params["apply_curation"]
+    LOGGING = full_params.get("logging", None)
+
+    # setup logging before any other logging call
+    if LOGGING is None:
+        logging.basicConfig(level="INFO", stream=sys.stdout, format="%(message)s")
+    elif LOGGING["package"] == "logging":
+        logging.basicConfig(stream=sys.stdout, **LOGGING.get("logging_cfg", {}))
+    elif LOGGING["package"] == "log-schema":
+        import log_schema
+
+        config = LOGGING.get("logging_cfg")
+        if config is not None and len(config) == 0:
+            config = None
+        log_schema.setup_logging(
+            config=config,
+            model={
+                "pipeline_name": LOGGING.get("pipeline_name", "AIND Ephys Pipeline"),
+                "acquisition_name": LOGGING.get("acquisition_name", "unknown"),
+                "process_name": "Apply curation",
+            },
+        )
+    logging.info("Begin processing...", extra={"event_type": "stage_start"})
     # noise_removal_strategy: 'unitrefine', 'bombcell', or both combined with & (both noise) or | (either noise)
     noise_removal_strategy = apply_curation_params.get("noise_removal_strategy", "unitrefine&bombcell")
     censor_ms = float(apply_curation_params.get("censor_ms", 0.5))
@@ -102,9 +127,9 @@ def run() -> None:
         if strategy not in valid_strategies:
             raise ValueError(f"Invalid noise removal strategy: {strategy}")
 
-    print(f"Noise removal strategy: {noise_removal_strategy}")
-    print(f"Censor period (ms): {censor_ms}")
-    print(f"Merging mode: {merging_mode}")
+    logging.info(f"Noise removal strategy: {noise_removal_strategy}")
+    logging.info(f"Censor period (ms): {censor_ms}")
+    logging.info(f"Merging mode: {merging_mode}")
 
     # Find sorted folder as the parent of the postprocessed folder
     ecephys_sorted_folders = [f.parent for f in data_folder.glob("**/postprocessed") if f.is_dir()]
@@ -121,17 +146,17 @@ def run() -> None:
     ]
     for postprocessed_folder in postprocessed_folders:
         recording_name = postprocessed_folder.name[:-5]  # Remove the ".zarr" suffix
-        print(recording_name)
+        logging.info(recording_name)
         output_folder = results_folder / f"postprocessed_{recording_name}.zarr"
 
         # Look for curation file
         curation_file = ecephys_sorted_folder / "curated" / recording_name / "curation.json"
         if not curation_file.is_file():
-            print(f"No curation file found for {recording_name}: copying original analyzer")
+            logging.info(f"No curation file found for {recording_name}: copying original analyzer")
             shutil.copytree(postprocessed_folder, output_folder)
             complete_unit_properties(si.load(output_folder, load_extensions=False).sorting, output_folder)
             continue
-        print(f"Found curation file for {recording_name}: {curation_file}")
+        logging.info(f"Found curation file for {recording_name}: {curation_file}")
 
         datetime_start = datetime.now(timezone.utc)
         analyzer = si.load(postprocessed_folder)
@@ -145,7 +170,7 @@ def run() -> None:
             if f"{strategy}_label" in analyzer.get_sorting_property_keys()
         ]
         if len(label_masks) < len(strategies):
-            print(f"\tMissing noise labels for {recording_name}: using {len(label_masks)}/{len(strategies)} labels")
+            logging.info(f"\tMissing noise labels for {recording_name}: using {len(label_masks)}/{len(strategies)} labels")
         if len(label_masks) == 0:
             mask = np.zeros(analyzer.get_num_units(), dtype=bool)
         elif "|" in noise_removal_strategy:
@@ -154,7 +179,6 @@ def run() -> None:
             mask = np.all(label_masks, axis=0)
 
         removed_unit_ids = analyzer.unit_ids[mask]
-        print(f"\tNoise units for {recording_name}: {len(removed_unit_ids)}/{analyzer.get_num_units()}")
 
         # Now get curation
         with open(curation_file, "r") as f:
@@ -166,9 +190,10 @@ def run() -> None:
             merge for merge in (curation.merges or [])
             if not any(unit in removed_unit_ids for unit in merge.unit_ids)
         ]
+        logging.info(f"\tCuration for {recording_name}: {len(curation.removed)} removed, {len(curation.merges)} merges")
 
         analyzer_curated = apply_curation(analyzer, curation, merging_mode=merging_mode, censor_ms=censor_ms, raise_error_if_overlap_fails=False)
-        print(f"\tCurated units for {recording_name}: {analyzer_curated.get_num_units()}")
+        logging.info(f"\tCurated units for {recording_name}: {analyzer_curated.get_num_units()}")
         analyzer_curated.save_as(format="zarr", folder=output_folder)
         restore_recording_provenance(postprocessed_folder, output_folder)
         complete_unit_properties(analyzer.sorting, output_folder)
@@ -197,6 +222,12 @@ def run() -> None:
         with open(results_folder / f"data_process_apply_curation_{recording_name}.json", "w") as f:
             f.write(apply_curation_process.model_dump_json(indent=3))
 
+    logging.info("Pipeline stage completed", extra={"event_type": "stage_complete"})
+
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except Exception:
+        logging.exception("Pipeline stage failed", extra={"event_type": "stage_error"})
+        raise
